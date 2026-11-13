@@ -1,51 +1,57 @@
+using MedicalApi.Data;
 using MedicalApi.Models;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 [ApiController]
 [Route("api/[controller]")]
 public class SpravkiController : ControllerBase
 {
-    // тестовые данные
-    public static List<Spravka> Spravki = new List<Spravka>
+    private readonly MedicalDbContext _db;
+
+    public SpravkiController(MedicalDbContext db)
     {
-        new Spravka { Id = 1, Name = "Справка 083", PatientId = 1, SpravkaTypeId = 1, Price = 100, IssuedAt = DateTime.Now.AddDays(-10) },
-        new Spravka { Id = 2, Name = "Справка в бассейн", PatientId = 1, SpravkaTypeId = 3, Price = 300, IssuedAt = DateTime.Now.AddDays(-3) },
-        new Spravka { Id = 3, Name = "Санитарная книжка", PatientId = 2, SpravkaTypeId = 2, Price = 750, IssuedAt = DateTime.Now.AddDays(-1) },
-    };
+        _db = db;
+    }
 
-    private static int _nextId = 4;
-
-    // GET /api/spravki                      все справки
-    // GET /api/spravki?patientId=1          справки одного пациента
-    // GET /api/spravki?sort=price           по цене (sort=date: по дате, новые сверху)
+    // GET /api/spravki                                   все справки
+    // GET /api/spravki?patientId=1                       справки одного пациента
+    // GET /api/spravki?minPrice=200                      не дешевле 200
+    // GET /api/spravki?sort=price  или  ?sort=date       сортировка (date: новые сверху)
+    // Фильтры можно комбинировать: ?patientId=1&minPrice=200&sort=price
     [HttpGet]
-    public List<Spravka> GetAll(int? patientId, string? sort)
+    public async Task<List<Spravka>> GetAll(int? patientId, decimal? minPrice, string? sort)
     {
-        List<Spravka> result = Spravki;
+        // пока не вызван ToListAsync, это только описание запроса, в базу он не уходит
+        IQueryable<Spravka> query = _db.Spravki;
 
         if (patientId != null)
         {
-            result = result.Where(s => s.PatientId == patientId).ToList();
+            query = query.Where(s => s.PatientId == patientId);
+        }
+        if (minPrice != null)
+        {
+            query = query.Where(s => s.Price >= minPrice);
         }
 
         if (sort == "price")
         {
-            result = result.OrderBy(s => s.Price).ToList();
+            query = query.OrderBy(s => s.Price);
         }
         else if (sort == "date")
         {
-            result = result.OrderByDescending(s => s.IssuedAt).ToList();
+            query = query.OrderByDescending(s => s.IssuedAt);
         }
 
-        return result;
+        return await query.ToListAsync();
     }
 
     [HttpGet("{id}")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public ActionResult<Spravka> GetById(int id)
+    public async Task<ActionResult<Spravka>> GetById(int id)
     {
-        Spravka? spravka = Spravki.FirstOrDefault(s => s.Id == id);
+        Spravka? spravka = await _db.Spravki.FirstOrDefaultAsync(s => s.Id == id);
         if (spravka == null)
         {
             return NotFound();
@@ -56,18 +62,20 @@ public class SpravkiController : ControllerBase
     [HttpPost]
     [ProducesResponseType(StatusCodes.Status201Created)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    public ActionResult<Spravka> Create(Spravka spravka)
+    public async Task<ActionResult<Spravka>> Create(Spravka spravka)
     {
-        string? error = CheckAndFill(spravka);
+        // номер выдаёт база, Id из тела запроса не используем
+        spravka.Id = 0;
+
+        string? error = await CheckAndFill(spravka);
         if (error != null)
         {
             return BadRequest(error);
         }
 
-        spravka.Id = _nextId;
-        _nextId++;
-        spravka.IssuedAt = DateTime.Now;
-        Spravki.Add(spravka);
+        spravka.IssuedAt = DateOnly.FromDateTime(DateTime.Now);
+        _db.Spravki.Add(spravka);
+        await _db.SaveChangesAsync();
         return CreatedAtAction(nameof(GetById), new { id = spravka.Id }, spravka);
     }
 
@@ -75,15 +83,15 @@ public class SpravkiController : ControllerBase
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public ActionResult<Spravka> Update(int id, Spravka spravka)
+    public async Task<ActionResult<Spravka>> Update(int id, Spravka spravka)
     {
-        Spravka? existing = Spravki.FirstOrDefault(s => s.Id == id);
+        Spravka? existing = await _db.Spravki.FirstOrDefaultAsync(s => s.Id == id);
         if (existing == null)
         {
             return NotFound();
         }
 
-        string? error = CheckAndFill(spravka);
+        string? error = await CheckAndFill(spravka);
         if (error != null)
         {
             return BadRequest(error);
@@ -93,35 +101,37 @@ public class SpravkiController : ControllerBase
         existing.SpravkaTypeId = spravka.SpravkaTypeId;
         existing.Name = spravka.Name;
         existing.Price = spravka.Price;
+        await _db.SaveChangesAsync();
         return Ok(existing);
     }
 
     [HttpDelete("{id}")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public ActionResult Delete(int id)
+    public async Task<ActionResult> Delete(int id)
     {
-        Spravka? spravka = Spravki.FirstOrDefault(s => s.Id == id);
+        Spravka? spravka = await _db.Spravki.FirstOrDefaultAsync(s => s.Id == id);
         if (spravka == null)
         {
             return NotFound();
         }
 
-        Spravki.Remove(spravka);
+        _db.Spravki.Remove(spravka);
+        await _db.SaveChangesAsync();
         return NoContent();
     }
 
     // Проверяет пациента и вид справки, и берёт название и цену из каталога.
     // Возвращает текст ошибки или null, если всё хорошо.
-    private string? CheckAndFill(Spravka spravka)
+    private async Task<string?> CheckAndFill(Spravka spravka)
     {
-        Patient? patient = PatientsController.Patients.FirstOrDefault(p => p.Id == spravka.PatientId);
+        Patient? patient = await _db.Patients.FirstOrDefaultAsync(p => p.Id == spravka.PatientId);
         if (patient == null)
         {
             return "Пациент с таким номером не найден. Сначала создайте пациента в картотеке";
         }
 
-        SpravkaType? type = SpravkaTypesController.Types.FirstOrDefault(t => t.Id == spravka.SpravkaTypeId);
+        SpravkaType? type = await _db.SpravkaTypes.FirstOrDefaultAsync(t => t.Id == spravka.SpravkaTypeId);
         if (type == null)
         {
             return "Такого вида справки нет в каталоге. Посмотрите список в /api/SpravkaTypes";

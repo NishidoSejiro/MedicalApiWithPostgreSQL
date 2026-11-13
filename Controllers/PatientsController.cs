@@ -1,33 +1,38 @@
+using MedicalApi.Data;
 using MedicalApi.Models;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 [ApiController]
 [Route("api/[controller]")]
 public class PatientsController : ControllerBase
 {
-    // тестовые данные, чтобы после запуска сразу было что смотреть
-    public static List<Patient> Patients = new List<Patient>
+    private readonly MedicalDbContext _db;
+
+    public PatientsController(MedicalDbContext db)
     {
-        new Patient { Id = 1, Name = "Алия Сатыбалдиева", BirthDate = new DateTime(1998, 3, 12), Phone = "+996700111222", Address = "ул. Абая 10, кв. 5", DistrictNumber = 3, HasInsurance = true },
-        new Patient { Id = 2, Name = "Бакыт Жумабеков", BirthDate = new DateTime(1985, 11, 2), Phone = "+996555333444", Address = "ул. Токтогула 45", DistrictNumber = 1, HasInsurance = false },
-        new Patient { Id = 3, Name = "Эмир Касымов", BirthDate = new DateTime(2015, 7, 21), Phone = "+996777555666", Address = "мкр. Асанбай 8, кв. 12", DistrictNumber = 2, HasInsurance = true },
-    };
+        _db = db;
+    }
 
-    // следующий свободный Id (не Count + 1, иначе после удаления Id повторяются)
-    private static int _nextId = 4;
-
+    // GET /api/patients               все пациенты по алфавиту
+    // GET /api/patients?name=ай       поиск по части имени, регистр не важен
     [HttpGet]
-    public List<Patient> GetAll()
+    public async Task<List<Patient>> GetAll(string? name)
     {
-        return Patients;
+        IQueryable<Patient> query = _db.Patients;
+        if (name != null)
+        {
+            query = query.Where(p => EF.Functions.ILike(p.Name, $"%{name}%"));
+        }
+        return await query.OrderBy(p => p.Name).ToListAsync();
     }
 
     [HttpGet("{id}")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public ActionResult<Patient> GetById(int id)
+    public async Task<ActionResult<Patient>> GetById(int id)
     {
-        Patient? patient = Patients.FirstOrDefault(p => p.Id == id);
+        Patient? patient = await _db.Patients.FirstOrDefaultAsync(p => p.Id == id);
         if (patient == null)
         {
             return NotFound();
@@ -38,17 +43,19 @@ public class PatientsController : ControllerBase
     [HttpPost]
     [ProducesResponseType(StatusCodes.Status201Created)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    public ActionResult<Patient> Create(Patient patient)
+    public async Task<ActionResult<Patient>> Create(Patient patient)
     {
+        // номер выдаёт база, а не клиент: Id из тела запроса сбрасываем
+        patient.Id = 0;
+
         string? error = Validate(patient);
         if (error != null)
         {
             return BadRequest(error);
         }
 
-        patient.Id = _nextId;
-        _nextId++;
-        Patients.Add(patient);
+        _db.Patients.Add(patient);
+        await _db.SaveChangesAsync();
         return CreatedAtAction(nameof(GetById), new { id = patient.Id }, patient);
     }
 
@@ -56,75 +63,90 @@ public class PatientsController : ControllerBase
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public ActionResult<Patient> Update([FromRoute] int id, [FromBody] Patient patient)
+    public async Task<ActionResult<Patient>> Update(int id, Patient patient)
     {
-        Patient? existing = Patients.FirstOrDefault(p => p.Id == id);
+        Patient? existing = await _db.Patients.FirstOrDefaultAsync(p => p.Id == id);
         if (existing == null)
-    {
-        return NotFound();
+        {
+            return NotFound();
+        }
+
+        string? error = Validate(patient);
+        if (error != null)
+        {
+            return BadRequest(error);
+        }
+
+        existing.Name = patient.Name;
+        existing.BirthDate = patient.BirthDate;
+        existing.Phone = patient.Phone;
+        existing.Address = patient.Address;
+        existing.DistrictNumber = patient.DistrictNumber;
+        existing.HasInsurance = patient.HasInsurance;
+
+        existing.Email = patient.Email;
+
+        await _db.SaveChangesAsync();
+        return Ok(existing);
     }
 
-    string? error = Validate(patient);
-    if (error != null)
-    {
-        return BadRequest(error);
-    }
-
-    existing.Name = patient.Name;
-    existing.BirthDate = patient.BirthDate;
-    existing.Phone = patient.Phone;
-    existing.Address = patient.Address;
-    existing.DistrictNumber = patient.DistrictNumber;
-    existing.HasInsurance = patient.HasInsurance;
-    
-    return Ok(existing);
-    }
-
-    // При удалении пациента удаляем и его справки и приёмы,
-    // иначе они останутся "висеть" без владельца.
+    // Пациента со справками или приёмами удалять нельзя: это медицинские записи.
+    // Без этой проверки база всё равно откажет (Restrict), но клиент получил бы 500.
     [HttpDelete("{id}")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public ActionResult Delete(int id)
+    public async Task<ActionResult> Delete(int id)
     {
-        Patient? patient = Patients.FirstOrDefault(p => p.Id == id);
+        Patient? patient = await _db.Patients.FirstOrDefaultAsync(p => p.Id == id);
         if (patient == null)
         {
             return NotFound();
         }
 
-        SpravkiController.Spravki.RemoveAll(s => s.PatientId == id);
-        AppointmentsController.Appointments.RemoveAll(a => a.PatientId == id);
-        Patients.Remove(patient);
+        bool hasSpravki = await _db.Spravki.AnyAsync(s => s.PatientId == id);
+        if (hasSpravki)
+        {
+            return BadRequest("Нельзя удалить пациента: на него выписаны справки. Справки это медицинские документы, они не удаляются вместе с пациентом");
+        }
+
+        bool hasAppointments = await _db.Appointments.AnyAsync(a => a.PatientId == id);
+        if (hasAppointments)
+        {
+            return BadRequest("Нельзя удалить пациента: у него есть записи на приём. Сначала удалите или отмените их");
+        }
+
+        _db.Patients.Remove(patient);
+        await _db.SaveChangesAsync();
         return NoContent();
     }
 
     [HttpGet("{id}/spravki")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public ActionResult<List<Spravka>> GetSpravki(int id)
+    public async Task<ActionResult<List<Spravka>>> GetSpravki(int id)
     {
-        Patient? patient = Patients.FirstOrDefault(p => p.Id == id);
-        if (patient == null)
+        bool exists = await _db.Patients.AnyAsync(p => p.Id == id);
+        if (!exists)
         {
             return NotFound();
         }
 
-        return SpravkiController.Spravki.Where(s => s.PatientId == id).ToList();
+        return await _db.Spravki.Where(s => s.PatientId == id).ToListAsync();
     }
 
     [HttpGet("{id}/appointments")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public ActionResult<List<Appointment>> GetAppointments(int id)
+    public async Task<ActionResult<List<Appointment>>> GetAppointments(int id)
     {
-        Patient? patient = Patients.FirstOrDefault(p => p.Id == id);
-        if (patient == null)
+        bool exists = await _db.Patients.AnyAsync(p => p.Id == id);
+        if (!exists)
         {
             return NotFound();
         }
 
-        return AppointmentsController.Appointments.Where(a => a.PatientId == id).ToList();
+        return await _db.Appointments.Where(a => a.PatientId == id).ToListAsync();
     }
 
     // null = данные верные, иначе текст ошибки (его покажет фронтенд)
@@ -138,17 +160,21 @@ public class PatientsController : ControllerBase
         {
             return "ФИО слишком длинное: максимум 100 символов";
         }
-        if (patient.BirthDate > DateTime.Now)
+        if (patient.BirthDate > DateOnly.FromDateTime(DateTime.Now))
         {
-            return "Дата рождения не может быть в будущем. Проверьте год";
+            return "Дата рождения не может быть в будущем";
         }
-        if (patient.BirthDate.Year < 1900)
+        if (patient.BirthDate < new DateOnly(1900, 1, 1))
         {
-            return "Дата рождения слишком давняя. Проверьте год";
+            return "Дата рождения слишком старая";
         }
         if (string.IsNullOrWhiteSpace(patient.Phone) || patient.Phone.Length < 7)
         {
             return "Укажите телефон, минимум 7 символов";
+        }
+        if (patient.Phone.Length > 20)
+        {
+            return "Телефон слишком длинный: максимум 20 символов";
         }
         if (patient.DistrictNumber <= 0)
         {
